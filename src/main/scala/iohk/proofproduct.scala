@@ -1,18 +1,26 @@
 package iohk
 
 import java.math.BigInteger
-import java.security.{KeyPair, PrivateKey, PublicKey}
+import java.security.{PublicKey, SecureRandom}
 
 import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Props}
 import akka.pattern.ask
 import akka.util.Timeout
+import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.damgardJurikProduct.{SigmaDJProductProverComputation, SigmaDJProductProverInput}
 import edu.biu.scapi.midLayer.asymmetricCrypto.encryption.{DJKeyGenParameterSpec, ScDamgardJurikEnc}
-import edu.biu.scapi.midLayer.ciphertext.AsymmetricCiphertext
-import edu.biu.scapi.midLayer.plaintext.BigIntegerPlainText
+import edu.biu.scapi.midLayer.ciphertext.{AsymmetricCiphertext, BigIntegerCiphertext}
 import iohk.ProductProof.system
+import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.dlog.SigmaDlogProverComputation
+import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.dlog.SigmaDlogProverInput
+import edu.biu.scapi.interactiveMidProtocols.zeroKnowledge.ZKFromSigmaProver
+import edu.biu.scapi.interactiveMidProtocols.zeroKnowledge.ZKProver
+import edu.biu.scapi.midLayer.asymmetricCrypto.keys.{DamgardJurikPrivateKey, DamgardJurikPublicKey}
+import edu.biu.scapi.midLayer.plaintext.BigIntegerPlainText
+import edu.biu.scapi.primitives.dlog.DlogGroup
+import edu.biu.scapi.primitives.dlog.miracl.MiraclDlogECF2m
 
 import scala.concurrent.duration._
-import scala.util.Random
+import scala.util.{Random, Try}
 
 object ProductProof extends App {
 
@@ -33,6 +41,8 @@ object Stop
 //for simplicity, let's include the public key in the messages, ideally, they'll be exchanged before
 case class AskMsg(pk: PublicKey)
 case class CipherMsg(pk: PublicKey, n: AsymmetricCiphertext)
+case class Announce(as: AsymmetricCiphertext, bs: AsymmetricCiphertext)
+case class Challenge(as: AsymmetricCiphertext, bs: AsymmetricCiphertext, cs: AsymmetricCiphertext)
 
 object EnvironmentActor {
   def props(target: ActorRef) = Props(new EnvironmentActor(target))
@@ -55,19 +65,26 @@ case class BrokerActor(alice: ActorRef, bob: ActorRef) extends Actor with DJ {
 
   import context.dispatcher
 
+  var fromA, fromB : BigInteger =_
+
   override def receive = {
     case Start =>
-      println("starting")
       implicit val timeout = Timeout(10.seconds)
       for {
-        cPkA <- { println("asking alice "); alice ? AskMsg(publicKey) }
-        cPkB <- { println("asking bob "); bob ? AskMsg(publicKey) }
+        cPkA <- alice ? AskMsg(publicKey)
+        cPkB <- bob ? AskMsg(publicKey)
       } yield {
 
         val CipherMsg(pkA, cA) = cPkA
         val CipherMsg(pkB, cB) = cPkB
-        val fromA = decryptBigInt(cA)
-        val fromB = decryptBigInt(cB)
+
+        val announce = Announce(cA, cB)
+
+        alice ! announce
+        bob ! announce
+
+        fromA = decryptBigInt(cA)
+        fromB = decryptBigInt(cB)
         val mult = fromA.multiply(fromB)
         val cMultA = encryptBigInt(pkA)(mult)
         val cMultB = encryptBigInt(pkB)(mult)
@@ -80,7 +97,18 @@ case class BrokerActor(alice: ActorRef, bob: ActorRef) extends Actor with DJ {
         system.terminate()
       }
 
-    //case Prove(pk,)
+    case Challenge(cA, cB, cC) =>
+
+      def toBGCt( as: AsymmetricCiphertext) = as.asInstanceOf[BigIntegerCiphertext]
+      val sigma = new SigmaDJProductProverComputation()
+      val prover = new ZKFromSigmaProver(null, sigma)
+      val txtA = new BigIntegerPlainText(fromA)
+      val txtB = new BigIntegerPlainText(fromB)
+      val input = new SigmaDJProductProverInput(publicKey.asInstanceOf[DamgardJurikPublicKey],
+        toBGCt(cA), toBGCt(cB), toBGCt(cC), privateKey.asInstanceOf[DamgardJurikPrivateKey], txtA, txtB )
+
+      sender ! Try { prover.prove(input) }
+
     case Stop => ()
 
 
@@ -92,18 +120,23 @@ object UserActor {
   def props = Props(new UserActor)
 }
 
-class UserActor extends Actor with DJ {
+class UserActor extends Actor with DJ with ActorLogging{
 
-  println("created user actor")
   private val secret = BigInteger.valueOf(Math.abs(Random.nextInt() % 10))
+
+  var cA, cB, cC: AsymmetricCiphertext =_
 
   override def receive = {
     case AskMsg(pk) =>
-      println(s"asked for pk=$pk from $sender")
       sender ! CipherMsg(publicKey, encryptBigInt(pk)(secret))
+    case Announce(mA,mB) =>
+      cA = mA
+      cB = mB
     case CipherMsg(pk, cMult) =>
+      cC = cMult
       val mult = decryptBigInt(cMult)
-      println(s" mult = ${mult}")
+      log.info(s"mult = $mult")
+      sender ! Challenge(cA, cB, cC)
   }
 
 }
