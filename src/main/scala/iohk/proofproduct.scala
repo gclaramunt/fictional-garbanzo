@@ -1,19 +1,22 @@
 package iohk
 
+import java.io
 import java.math.BigInteger
 import java.security.{PublicKey, SecureRandom}
+import java.util.concurrent.ConcurrentLinkedDeque
 
 import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Props}
 import akka.pattern.ask
 import akka.util.Timeout
-import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.damgardJurikProduct.{SigmaDJProductProverComputation, SigmaDJProductProverInput}
+import edu.biu.scapi.comm.Channel
+import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.damgardJurikKnowledge.SigmaDJKnowledgeCommonInput
+import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.damgardJurikProduct.{SigmaDJProductProverComputation, SigmaDJProductProverInput, SigmaDJProductVerifierComputation}
 import edu.biu.scapi.midLayer.asymmetricCrypto.encryption.{DJKeyGenParameterSpec, ScDamgardJurikEnc}
 import edu.biu.scapi.midLayer.ciphertext.{AsymmetricCiphertext, BigIntegerCiphertext}
 import iohk.ProductProof.system
 import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.dlog.SigmaDlogProverComputation
 import edu.biu.scapi.interactiveMidProtocols.sigmaProtocol.dlog.SigmaDlogProverInput
-import edu.biu.scapi.interactiveMidProtocols.zeroKnowledge.ZKFromSigmaProver
-import edu.biu.scapi.interactiveMidProtocols.zeroKnowledge.ZKProver
+import edu.biu.scapi.interactiveMidProtocols.zeroKnowledge.{ZKCommonInput, ZKFromSigmaProver, ZKFromSigmaVerifier, ZKProver}
 import edu.biu.scapi.midLayer.asymmetricCrypto.keys.{DamgardJurikPrivateKey, DamgardJurikPublicKey}
 import edu.biu.scapi.midLayer.plaintext.BigIntegerPlainText
 import edu.biu.scapi.primitives.dlog.DlogGroup
@@ -42,7 +45,7 @@ object Stop
 case class AskMsg(pk: PublicKey)
 case class CipherMsg(pk: PublicKey, n: AsymmetricCiphertext)
 case class Announce(as: AsymmetricCiphertext, bs: AsymmetricCiphertext)
-case class Challenge(as: AsymmetricCiphertext, bs: AsymmetricCiphertext, cs: AsymmetricCiphertext)
+case class Challenge(c: Channel, as: AsymmetricCiphertext, bs: AsymmetricCiphertext, cs: AsymmetricCiphertext)
 
 object EnvironmentActor {
   def props(target: ActorRef) = Props(new EnvironmentActor(target))
@@ -61,7 +64,7 @@ object BrokerActor {
   def props(alice: ActorRef, bob: ActorRef) = Props(new BrokerActor(alice, bob))
 }
 
-case class BrokerActor(alice: ActorRef, bob: ActorRef) extends Actor with DJ {
+case class BrokerActor(alice: ActorRef, bob: ActorRef) extends Actor with DJ with ActorLogging {
 
   import context.dispatcher
 
@@ -89,27 +92,29 @@ case class BrokerActor(alice: ActorRef, bob: ActorRef) extends Actor with DJ {
         val cMultA = encryptBigInt(pkA)(mult)
         val cMultB = encryptBigInt(pkB)(mult)
 
-        println(
+        log.info(
           s" got fromA = $fromA fromB = $fromB sending mult ${mult.intValue()}")
         alice ! CipherMsg(publicKey, cMultA)
         bob ! CipherMsg(publicKey, cMultB)
-        sender ! Stop
-        system.terminate()
+
       }
 
-    case Challenge(cA, cB, cC) =>
+    case Challenge(channel, cA, cB, cC) =>
 
       def toBGCt( as: AsymmetricCiphertext) = as.asInstanceOf[BigIntegerCiphertext]
       val sigma = new SigmaDJProductProverComputation()
-      val prover = new ZKFromSigmaProver(null, sigma)
+      val prover = new ZKFromSigmaProver(channel, sigma)
       val txtA = new BigIntegerPlainText(fromA)
       val txtB = new BigIntegerPlainText(fromB)
       val input = new SigmaDJProductProverInput(publicKey.asInstanceOf[DamgardJurikPublicKey],
         toBGCt(cA), toBGCt(cB), toBGCt(cC), privateKey.asInstanceOf[DamgardJurikPrivateKey], txtA, txtB )
 
-      sender ! Try { prover.prove(input) }
+      sender ! input.getCommonParams
+      prover.prove(input)
 
-    case Stop => ()
+      self ! Stop
+
+    case Stop => system.terminate()
 
 
   }
@@ -121,6 +126,10 @@ object UserActor {
 }
 
 class UserActor extends Actor with DJ with ActorLogging{
+
+  import context.dispatcher
+
+  implicit val timeout = Timeout(10.seconds)
 
   private val secret = BigInteger.valueOf(Math.abs(Random.nextInt() % 10))
 
@@ -136,7 +145,14 @@ class UserActor extends Actor with DJ with ActorLogging{
       cC = cMult
       val mult = decryptBigInt(cMult)
       log.info(s"mult = $mult")
-      sender ! Challenge(cA, cB, cC)
+      val channel = new QueueChannel
+      val sVC = new SigmaDJProductVerifierComputation()
+      val validator = new ZKFromSigmaVerifier(channel, sVC, new SecureRandom)
+      for {
+        input <- sender ? Challenge(channel, cA, cB, cC)
+      } yield {
+        validator.verify(input.asInstanceOf[ZKCommonInput])
+      }
   }
 
 }
@@ -174,4 +190,20 @@ trait DJ {
     plaintext.getX
   }
 
+}
+
+class QueueChannel extends Channel {
+
+  private val queue = new ConcurrentLinkedDeque[io.Serializable]()
+
+  override def receive() = { println("receiving"); queue.poll}
+
+  override def isClosed = false
+
+  override def close() = ()
+
+  override def send(data: io.Serializable) = {
+    println(s" add $data")
+    queue.add(data)
+  }
 }
